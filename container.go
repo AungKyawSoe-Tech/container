@@ -1,35 +1,74 @@
-name: Go CI
+package main
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+import (
+	"fmt"
+	"io/ioutil"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"syscall"
+)
 
-jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
+// go run main.go run <cmd> <args>
+func main() {
+	switch os.Args[1] {
+	case "run":
+		run()
+	case "child":
+		child()
+	default:
+		panic("help")
+	}
+}
 
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+func run() {
+	fmt.Printf("running %v \n", os.Args[2:])
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
+	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, os.Args[2:]...)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:   syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		Unshareflags: syscall.CLONE_NEWNS,
+	}
 
-    - name: Build
-      run: go build -v ./...
+	must(cmd.Run())
+}
 
-    - name: Run tests
-      run: go test -v ./...
+func child() {
+	fmt.Printf("child running %v \n", os.Args[2:])
 
-    - name: Run go vet
-      run: go vet ./...
+	cg()
 
-    # Optional: Uncomment if you want linting (requires golint)
-    # - name: Install golint
-    #   run: go install golang.org/x/lint/golint@latest
-    # - name: Run golint
-    #   run: golint ./...
+	cmd := exec.Command(os.Args[2], os.Args[3:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	must(syscall.Sethostname([]byte("container")))
+	must(syscall.Chroot("/home/work/rootfs"))
+	must(os.Chdir("/"))
+
+	if err := cmd.Run(); err != nil {
+		fmt.Println("ERROR", err)
+		os.Exit(1)
+	}
+}
+
+func cg() {
+	cgroups := "/sys/fs/cgroup/"
+	pids := filepath.Join(cgroups, "pids")
+	os.Mkdir(filepath.Join(pids, "container"), 0755)
+	must(ioutil.WriteFile(filepath.Join(pids, "container/pids.max"), []byte("20"), 0700))
+	// Removes the new cgroup in place after the container exits
+	must(ioutil.WriteFile(filepath.Join(pids, "container/notify_on_release"), []byte("1"), 0700))
+	must(ioutil.WriteFile(filepath.Join(pids, "container/cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0700))
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
